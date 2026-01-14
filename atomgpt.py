@@ -3,6 +3,7 @@ import torch
 from contextlib import nullcontext
 import torch.nn.functional as func
 from data_utils import fetch_data, get_batch
+from utils import save_checkpoint, load_checkpoint
 
 # Use float16/mix32 for (memory and speed)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,37 +80,37 @@ def attention(device):
 
 def model_and_parameters(device):
     # Parameters
-    token_to_embedding = torch.nn.Parameter(torch.zeros((VOCAB_SIZE, NUM_EMBED_DIM), device=device).normal_(std=0.02))
-    layer_norm_weight = torch.nn.Parameter(torch.empty(NUM_EMBED_DIM, device=device).normal_(std=0.02))
-    layer_norm_bias = torch.nn.Parameter(torch.empty(NUM_EMBED_DIM, device=device).normal_(std=0.02))
-    pre_synaptic = torch.nn.Parameter(torch.zeros((NUM_ATTN_HEADS, NUM_EMBED_DIM, NUM_NEURONS), device=device).normal_(std=0.02))
-    post_synaptic = torch.nn.Parameter(torch.zeros((NUM_ATTN_HEADS, NUM_EMBED_DIM, NUM_NEURONS), device=device).normal_(std=0.02))
-    bind_synaptic = torch.nn.Parameter(torch.zeros((NUM_ATTN_HEADS * NUM_NEURONS, NUM_EMBED_DIM), device=device).normal_(std=0.02))
-    read_out = torch.nn.Parameter(torch.zeros((NUM_EMBED_DIM, VOCAB_SIZE), device=device).normal_(std=0.02))
-
-    parameters = torch.nn.ParameterList([token_to_embedding, layer_norm_weight, layer_norm_bias, pre_synaptic, post_synaptic, bind_synaptic, read_out])
+    parameters = {
+        'token_embedding': torch.nn.Parameter(torch.zeros((VOCAB_SIZE, NUM_EMBED_DIM), device=device).normal_(std=0.02)),
+        'layer_norm_weight': torch.nn.Parameter(torch.empty(NUM_EMBED_DIM, device=device).normal_(std=0.02)),
+        'layer_norm_bias': torch.nn.Parameter(torch.empty(NUM_EMBED_DIM, device=device).normal_(std=0.02)),
+        'pre_synaptic': torch.nn.Parameter(torch.zeros((NUM_ATTN_HEADS, NUM_EMBED_DIM, NUM_NEURONS), device=device).normal_(std=0.02)),
+        'post_synaptic': torch.nn.Parameter(torch.zeros((NUM_ATTN_HEADS, NUM_EMBED_DIM, NUM_NEURONS), device=device).normal_(std=0.02)),
+        'bind_synapse': torch.nn.Parameter(torch.zeros((NUM_ATTN_HEADS * NUM_NEURONS, NUM_EMBED_DIM), device=device).normal_(std=0.02)),
+        'read_out': torch.nn.Parameter(torch.zeros((NUM_EMBED_DIM, VOCAB_SIZE), device=device).normal_(std=0.02))
+    }
 
     def forward(token_ids, training=True):
         batch, num_tokens = token_ids.size()
 
-        token_embeddings = token_to_embedding[token_ids].unsqueeze(1)
-        token_embeddings = func.layer_norm(token_embeddings, [NUM_EMBED_DIM], layer_norm_weight, layer_norm_bias, 1e-5)
+        token_embeddings = parameters['token_embedding'][token_ids].unsqueeze(1)
+        token_embeddings = func.layer_norm(token_embeddings, [NUM_EMBED_DIM], parameters['layer_norm_weight'], parameters['layer_norm_bias'], 1e-5)
 
         for _ in range(NUM_ITER_REFINE):
-            pre_neuron_activation = func.relu((token_embeddings @ pre_synaptic))
+            pre_neuron_activation = func.relu((token_embeddings @ parameters['pre_synaptic']))
 
             neighbor_aware_act = attention(device)(pre_neuron_activation, pre_neuron_activation, token_embeddings)
-            neighbor_aware_act = func.layer_norm(neighbor_aware_act, [NUM_EMBED_DIM], layer_norm_weight, layer_norm_bias, 1e-5)
+            neighbor_aware_act = func.layer_norm(neighbor_aware_act, [NUM_EMBED_DIM], parameters['layer_norm_weight'], parameters['layer_norm_bias'], 1e-5)
 
-            post_neuron_activation = func.relu((neighbor_aware_act @ post_synaptic))
+            post_neuron_activation = func.relu((neighbor_aware_act @ parameters['post_synaptic']))
 
             bind_neuron_activation = func.dropout((pre_neuron_activation * post_neuron_activation), p=0.1, training=training)
-            bind_neuron_activation = bind_neuron_activation.transpose(1, 2).reshape(batch, 1, num_tokens, NUM_NEURONS*NUM_ATTN_HEADS) @ bind_synaptic
-            bind_neuron_activation = func.layer_norm(bind_neuron_activation, [NUM_EMBED_DIM], layer_norm_weight, layer_norm_bias, 1e-5)
+            bind_neuron_activation = bind_neuron_activation.transpose(1, 2).reshape(batch, 1, num_tokens, NUM_NEURONS*NUM_ATTN_HEADS) @ parameters['bind_synapse']
+            bind_neuron_activation = func.layer_norm(bind_neuron_activation, [NUM_EMBED_DIM], parameters['layer_norm_weight'], parameters['layer_norm_bias'], 1e-5)
 
-            token_embeddings = func.layer_norm((token_embeddings + bind_neuron_activation), [NUM_EMBED_DIM], layer_norm_weight, layer_norm_bias, 1e-5)
+            token_embeddings = func.layer_norm((token_embeddings + bind_neuron_activation), [NUM_EMBED_DIM], parameters['layer_norm_weight'], parameters['layer_norm_bias'], 1e-5)
 
-        logits = token_embeddings.view(batch, num_tokens, NUM_EMBED_DIM) @ read_out
+        logits = token_embeddings.view(batch, num_tokens, NUM_EMBED_DIM) @ parameters['read_out']
 
         return logits
 
@@ -118,7 +119,7 @@ def model_and_parameters(device):
 def generate_tokens(model_runner, tokens, max_new_tokens, temperature=1.0, top_k=None):
     for _ in range(max_new_tokens):
         input_tokens = tokens
-        model_output = model_runner(input_tokens)[:, -1, :] / temperature
+        model_output = model_runner(input_tokens, False)[:, -1, :] / temperature
         if top_k is not None:
             values, _ = torch.topk(model_output, min(top_k, model_output.size(-1)))
             model_output[model_output < values[:, [-1]]] = float('-inf')
@@ -143,11 +144,14 @@ def train_per_batch(model_forward_pass, optimizer, input_batch, expected_batch):
 
     return loss.item()
 
-def main():
+def main(load_from_checkpoint=True):
     fetch_data()
 
     model_runner, model_parameters = model_and_parameters(DEVICE)
-    optimizer = torch.optim.AdamW(model_parameters, lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(torch.nn.ParameterList(model_parameters.values()), lr=LEARNING_RATE)
+
+    if load_from_checkpoint:
+        _, _ = load_checkpoint(model_parameters, 'model-checkpoints', DEVICE)
 
     steps = 0
     loss_per_batch = 0
@@ -160,6 +164,8 @@ def main():
         steps += 1
         loss_per_batch += loss
 
+        save_checkpoint('model-checkpoints', epoch, model_parameters, optimizer=optimizer)
+
         if epoch % LOG_RESULTS_FREQ == 0:
             print(f'Epoch: {epoch}/{MAX_EPOCHS} loss {loss_per_batch / steps:.3}')
 
@@ -167,9 +173,8 @@ def main():
             input_tokens = torch.tensor(bytearray(prompt, "utf-8"), dtype=torch.long, device=DEVICE).unsqueeze(0)
             ret = generate_tokens(model_runner, input_tokens, max_new_tokens=100, top_k=3)
             ret_decoded = bytes(ret.to(torch.uint8).to("cpu").squeeze(0)).decode(errors="backslashreplace")
-            print(f'{GREEN}Generated{RESET}')
+            print(f'{GREEN}Generated{RESET}:')
             print(ret_decoded)
-
             loss_per_batch = 0
             steps = 0
 
