@@ -1,6 +1,12 @@
 import math
 import torch
-from torch.nn.functional import relu, layer_norm, dropout
+from torch.nn.functional import relu, dropout
+
+def rms_norm(hidden_state, variance_eps=1e-5):
+    variance = hidden_state.square().mean(-1, keepdim=True)
+    hidden_state = hidden_state * torch.rsqrt(variance + variance_eps)
+
+    return hidden_state
 
 def apply_rotary_pos_emb(input_embeddings):
     def get_angular_frequency(dim, theta=10000.0, dtype=torch.float32):
@@ -33,45 +39,40 @@ def apply_rotary_pos_emb(input_embeddings):
 
     return input_embeddings * cos + rotated_embeddings * sin
 
-def attention(query, key, value):
+def attention(query, key, value, auto_regressive=False):
     assert key is query
     query_with_rope = apply_rotary_pos_emb(query)
     key_with_rope = query_with_rope
 
-    scores = ((query_with_rope @ key_with_rope.mT) / math.sqrt(query_with_rope.shape[-1]))
+    if auto_regressive: scores = ((query_with_rope @ key_with_rope.mT) / math.sqrt(query_with_rope.shape[-1])).tril(diagonal=-1)
+    else: scores = ((query_with_rope @ key_with_rope.mT) / math.sqrt(query_with_rope.shape[-1]))
 
     return scores @ value
 
-def universal_node(input_feature_size, num_mini_pool, neurons_per_pool, possible_predictions=10, dropout_prob=0.1, num_refine=1, device='cuda'):
+
+def universal_node(input_feature_size, num_mini_pool, neurons_per_pool, dropout_prob=0.1, num_refine=1, auto_regressive=False, device='cuda'):
     total_neurons = num_mini_pool * neurons_per_pool
     parameters = {
-        'layer_norm_weight': torch.nn.Parameter(torch.empty(input_feature_size, device=device).normal_(std=0.02)),
-        'layer_norm_bias': torch.nn.Parameter(torch.empty(input_feature_size, device=device).normal_(std=0.02)),
         'pre_synaptic': torch.nn.Parameter(torch.zeros((num_mini_pool, input_feature_size, neurons_per_pool), device=device).normal_(std=0.02)),
         'post_synaptic': torch.nn.Parameter(torch.zeros((num_mini_pool, input_feature_size, neurons_per_pool), device=device).normal_(std=0.02)),
         'bind_synapse': torch.nn.Parameter(torch.zeros((total_neurons, input_feature_size), device=device).normal_(std=0.02)),
     }
 
-    feedback_params = {}
-    for name, params in parameters.items():
-        if params.ndim == 1: shape = (possible_predictions,) + tuple(params.shape)
-        elif params.ndim == 2: shape = (possible_predictions,) + tuple([params.shape[-1]])
-        else: shape = (possible_predictions,) + tuple([params.shape[0]*params.shape[-1]])
-        feedback_params[name] = torch.zeros(shape, device=device)
-
     def forward(input_features, train_mode=True):
         batch, num_tokens, _ = input_features.shape
-        normalized_features = layer_norm(input_features.unsqueeze(1), [input_feature_size], parameters['layer_norm_weight'], parameters['layer_norm_bias'], 1e-5)
+        normalized_features = rms_norm(input_features).unsqueeze(1)
+
         for _ in range(num_refine):
             pre_neurons_activity = relu(normalized_features @ parameters['pre_synaptic'])
-            attention_output = attention(pre_neurons_activity, pre_neurons_activity, normalized_features)
-            normalized_attn_output = layer_norm(attention_output, [input_feature_size], parameters['layer_norm_weight'], parameters['layer_norm_bias'], 1e-5)
+            attention_output = attention(pre_neurons_activity, pre_neurons_activity, normalized_features, auto_regressive)
+            normalized_attn_output = rms_norm(attention_output)
             post_neurons_activity = relu(normalized_attn_output @ parameters['post_synaptic'])
 
             bind_neurons_activity = dropout((pre_neurons_activity * post_neurons_activity), dropout_prob, train_mode)
             bind_neurons_activity = bind_neurons_activity.reshape(batch, 1, num_tokens, num_mini_pool*neurons_per_pool) @ parameters['bind_synapse']
+            normalized_bind_neurons_activity = rms_norm(bind_neurons_activity)
 
-            normalized_features = layer_norm(bind_neurons_activity, [input_feature_size], parameters['layer_norm_weight'], parameters['layer_norm_bias'], 1e-5)
+            normalized_features = rms_norm(normalized_features + normalized_bind_neurons_activity)
 
         return normalized_features.view(batch, num_tokens, input_feature_size)
 
