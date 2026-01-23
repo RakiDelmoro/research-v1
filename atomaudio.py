@@ -24,7 +24,7 @@ def model_and_parameters(device):
     NUM_CLASSES = 10
     AUDIO_PATCH_SIZE = 16
 
-    node_runner, parameters, = universal_node(NEURONS_PER_MINI_POOL, NUM_MINI_POOL, NEURONS_PER_MINI_POOL, DROPOUT, REFINEMENT_STEPS, False, device)
+    node_runner, parameters, = universal_node(NUM_MINI_POOL, NEURONS_PER_MINI_POOL, DROPOUT, REFINEMENT_STEPS, False, device)
 
     # For vision parameters
     parameters['conv2d_weights'] = torch.nn.Parameter(torch.zeros(NEURONS_PER_MINI_POOL, 1, AUDIO_PATCH_SIZE, AUDIO_PATCH_SIZE, device=device).normal_(std=0.02), requires_grad=False)
