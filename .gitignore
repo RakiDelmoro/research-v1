@@ -1,0 +1,8 @@
+model-checkpoints
+model-v2-checkpoints
+audio-checkpoints
+vision-checkpoints
+datasets
+audio-dataset
+sandbox.py
+__pycache__/
